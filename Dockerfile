@@ -3,10 +3,10 @@ FROM python:3.13.0a2-alpine
 
 # Install python and pip
 RUN apk add --no-cache --update python3 py3-pip bash
-ADD ./webapp/requirements.txt /webapp/requirements.txt
+ADD ./webapp/requirements.txt /tmp/requirements.txt
 
 # Install dependencies
-RUN pip3 install --no-cache-dir -q -r /webapp/requirements.txt
+RUN pip3 install --no-cache-dir -q -r /tmp/requirements.txt
 
 # Add our code
 ADD ./webapp /opt/webapp/
