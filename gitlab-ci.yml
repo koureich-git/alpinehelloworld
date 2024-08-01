@@ -1,0 +1,199 @@
+image: docker:latest
+default:
+  interruptible: true
+services:
+  - name: docker:dind
+    alias: docker
+variables:
+  APK_CACHE_DIR: $CI_PROJECT_DIR/.cache/apk
+
+stages:
+  - build
+  - Test acceptation
+  - Release
+  - Deploy review
+  - Stop review
+  - Deploy staging
+  - Test staging
+  - Deploy prod
+  - Test prod
+
+
+.before_script_ssh: &setup_ssh
+  before_script:
+    - mkdir -p $APK_CACHE_DIR
+    - apk add openssh-client --cache-dir $APK_CACHE_DIR
+    - eval $(ssh-agent -s)
+    - mkdir -p ~/.ssh
+    - chmod -R 400 ~/.ssh
+    - touch ~/.ssh/known_hosts
+    - cd ~/.ssh
+    - echo "${SSH_KEY}" > id_rsa
+    - chmod 0400 id_rsa
+    - ssh-keyscan -t rsa  ${HOSTNAME_DEPLOY} >> ~/.ssh/known_hosts
+  cache:
+    key: cache-apk
+    paths:
+      - $APK_CACHE_DIR
+
+
+.deploy_template: &deploy
+  interruptible: false
+  script:
+    - command1="docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
+    - command2="docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+    - command3="docker rm -f webapp"
+    - command4="docker run -d -p 80:5000 -e PORT=5000 --name webapp $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+    - ssh -t ${SSH_USER}@${HOSTNAME_DEPLOY}
+      -o SendEnv=CI_REGISTRY_IMAGE
+      -o SendEnv=CI_COMMIT_REF_SLUG
+      -o SendEnv=CI_REGISTRY_USER
+      -o SendEnv=CI_REGISTRY_PASSWORD
+      -o SendEnv=CI_REGISTRY
+      -C "$command1 && $command2 && $command3 && $command4"
+
+
+.test_template: &test
+  image: alpine
+  variables:
+    GIT_STRATEGY: none
+  only:
+    - master
+  script:
+    - mkdir -p $APK_CACHE_DIR
+    - apk add curl --cache-dir $APK_CACHE_DIR
+    - curl http://${HOSTNAME_DEPLOY} | grep "Hello world Anselme!"
+  cache:
+    key: cache-apk
+    paths:
+      - $APK_CACHE_DIR
+  dependencies: []
+
+
+.fact_deploy: &fact_deploy
+  variables:
+    GIT_STRATEGY: none
+  only:
+   - master
+  <<: *setup_ssh
+  <<: *deploy
+  dependencies: []
+
+
+docker-build:
+  # Use the official docker image.
+  stage: build
+  rules:
+    - if: $CI_OPEN_MERGE_REQUESTS || $CI_COMMIT_REF_SLUG
+  script:
+    - docker build -t  alpinehelloworld .
+    - docker save alpinehelloworld > alpinehelloworld.tar
+  artifacts:
+    paths:
+      - alpinehelloworld.tar  
+
+
+test acceptation:
+  # Official docker image.
+  stage: Test acceptation
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker load < alpinehelloworld.tar
+    - docker run -d -p 80:5000 -e PORT=5000 --name webapp alpinehelloworld
+    - sleep 5
+    - apk add curl --cache-dir $APK_CACHE_DIR
+    - docker exec webapp python tests.py
+    - curl "http://docker" | grep  "Hello world Anselme!"
+  cache:
+    key: cache-apk
+    paths:
+      - $APK_CACHE_DIR
+
+
+release image:
+  stage: Release
+  variables:
+    GIT_STRATEGY: none
+  only: 
+    - master
+    - merge_requests
+  script:
+    - docker load < alpinehelloworld.tar
+    - docker tag alpinehelloworld "${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_NAME}"
+    - docker tag alpinehelloworld "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker push "${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_NAME}"
+    - docker push "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+
+
+deploy review:
+  stage: Deploy review
+  variables:
+    GIT_STRATEGY: none
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    url: http://{HOSTNAME_DEPLOY} #eg: http://ec2-54-211-169-95.compute-1.amazonaws.com
+    on_stop: stop review
+  only:
+    - merge_requests
+  <<: *setup_ssh
+  script:
+    - command1="docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
+    - command2="docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME"
+    - command3="docker run -d -p 80:5000 -e PORT=5000 --name webapp $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME || (echo \"Feature already exist on this environment!\" && exit 125)"
+    - ssh -t ${SSH_USER}@${HOSTNAME_DEPLOY} 
+      -o SendEnv=CI_REGISTRY_IMAGE 
+      -o SendEnv=CI_COMMIT_REF_NAME 
+      -o SendEnv=CI_REGISTRY_USER 
+      -o SendEnv=CI_REGISTRY_PASSWORD 
+      -o SendEnv=CI_REGISTRY 
+      -C "$command1 && $command2 && $command3"
+  dependencies: []
+
+
+stop review:
+  stage: Stop review
+  variables:
+    GIT_STRATEGY: none
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    action: stop
+  only:
+    - merge_requests
+  when: manual
+  <<: *setup_ssh
+  script:
+    - command1="docker rm -vf webapp"
+    - command2="docker rmi $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME"
+    - ssh -t ${SSH_USER}@${HOSTNAME_DEPLOY} 
+      -o SendEnv=CI_REGISTRY_IMAGE 
+      -o SendEnv=CI_COMMIT_REF_NAME 
+      -C "$command1 && $command2"
+  dependencies: []
+
+
+deploy staging: 
+  stage: Deploy staging
+  environment:
+    name: staging
+    url: http://${HOSTNAME_DEPLOY}
+  <<: *fact_deploy
+
+
+deploy prod: 
+  stage: Deploy prod
+  environment:
+    name: prod
+    url: http://${HOSTNAME_DEPLOY}
+  <<: *fact_deploy
+
+
+test staging:
+  <<: *test
+  stage: Test staging
+
+
+test prod:
+  <<: *test
+  stage: Test prod
